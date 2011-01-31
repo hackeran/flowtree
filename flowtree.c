@@ -46,6 +46,9 @@ int main(int argc, char * const argv[]) {
   /* Network data */
   char buffer[BUFFSIZE];
   ssize_t msgsize;
+  fd_set read_fd;
+  struct timeval tv;
+  int select_ret;
 
   /* Make our socket */
   if ((sock_fh = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) == -1) {
@@ -87,20 +90,41 @@ int main(int argc, char * const argv[]) {
 
 
   /* Testing receive, will do better in final code */
-  if ((msgsize = recvfrom(sock_fh, buffer, BUFFSIZE, 0,
-			  (struct sockaddr *)&peer_addrin,
-			  &peeraddrlen)) == -1) {
-    fprintf(stderr, "recvfrom() call failed!\n");
-    perror("recvfrom");
-    return 1;
-  }
-  else {
-    fprintf(stderr, "Got a packet from %s:%d; size=%d\n",
-	    inet_ntoa(peer_addrin.sin_addr), ntohs(peer_addrin.sin_port),
-	    (int)msgsize);
+  while (1) {
+
+    FD_ZERO(&read_fd);
+    FD_SET(sock_fh, &read_fd);
+    tv.tv_sec = 5;
+    tv.tv_usec = 0;
+
+    /* See if we have data */
+    if ((select_ret = select(sock_fh + 1, &read_fd, NULL, NULL, &tv)) == -1) {
+      fprintf(stderr, "Call to select() failed.\n");
+      perror("select");
+      return 1;
+    }
+
+    /* Nothing came ready */
+    if (select_ret == 0) {
+      continue;
+    }
+
+    if ((msgsize = recvfrom(sock_fh, buffer, BUFFSIZE, 0,
+			    (struct sockaddr *)&peer_addrin,
+			    &peeraddrlen)) == -1) {
+      fprintf(stderr, "recvfrom() call failed!\n");
+      perror("recvfrom");
+      return 1;
+    }
+    else {
+      fprintf(stderr, "Got a packet from %s:%d; size=%d\n",
+	      inet_ntoa(peer_addrin.sin_addr), ntohs(peer_addrin.sin_port),
+	      (int)msgsize);
+    }
+    
   }
 
-  close(sock_fh);
+    close(sock_fh);
 
   return 0;
 }
