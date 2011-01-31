@@ -4,6 +4,8 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <signal.h>
+#include <errno.h>
 
 /* We want to favor the BSD structs over the Linux ones */
 #ifndef __USE_BSD
@@ -23,6 +25,9 @@
 /* The AVL tree */
 #include "pavl.h"
 
+/* The listen loop */
+int listen_stop = 0;
+
 
 #define BINDADDR "132.239.1.114"
 #define BINDPORT 2055
@@ -31,11 +36,16 @@
 
 /* Function prototypes */
 int main(int, char * const []);
+void sig_stop_listen(int);
 
 
 int main(int argc, char * const argv[]) {
 
-  /* Socket vars */
+  /* === Signal vars === */
+  struct sigaction sa_new, sa_old;
+  sigset_t sigmask, emptysigmask;
+
+  /* === Socket vars === */
   struct sockaddr_in bind_addrin, peer_addrin;
   in_addr_t bind_addr;
   int sock_fh;
@@ -47,8 +57,24 @@ int main(int argc, char * const argv[]) {
   char buffer[BUFFSIZE];
   ssize_t msgsize;
   fd_set read_fd;
-  struct timeval tv;
+  struct timespec sel_timespec;
   int select_ret;
+
+  /* Before we start listening we need to setup a signal
+   * handler so we can cleanly exit */
+  memset(&sa_new, 0, sizeof(struct sigaction));
+  sa_new.sa_handler = sig_stop_listen;
+  sigaction(SIGTERM, &sa_new, &sa_old);
+  memset(&sa_new, 0, sizeof(struct sigaction));
+  sa_new.sa_handler = sig_stop_listen;
+  sigaction(SIGINT, &sa_new, &sa_old);
+
+  /* Setup the masks for pselect() */
+  sigemptyset(&emptysigmask);
+  sigemptyset(&sigmask);
+  sigaddset(&sigmask, SIGTERM);
+  sigaddset(&sigmask, SIGINT);
+
 
   /* Make our socket */
   if ((sock_fh = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) == -1) {
@@ -90,25 +116,33 @@ int main(int argc, char * const argv[]) {
 
 
   /* Testing receive, will do better in final code */
-  while (1) {
+  while (listen_stop == 0) {
 
     FD_ZERO(&read_fd);
     FD_SET(sock_fh, &read_fd);
-    tv.tv_sec = 5;
-    tv.tv_usec = 0;
+    sel_timespec.tv_sec = 0;
+    sel_timespec.tv_nsec = 100000000; /* .1 seconds */
+
+    /* Block signals */
+    sigprocmask(SIG_BLOCK, &emptysigmask, NULL);
 
     /* See if we have data */
-    if ((select_ret = select(sock_fh + 1, &read_fd, NULL, NULL, &tv)) == -1) {
-      fprintf(stderr, "Call to select() failed.\n");
-      perror("select");
-      return 1;
+    if ((select_ret = pselect(sock_fh + 1, &read_fd, NULL, NULL,
+			      &sel_timespec, &emptysigmask)) == -1) {
+      if (errno != EINTR) {
+	fprintf(stderr, "Call to pselect() failed.\n");
+	perror("pselect");
+	return 1;
+      }
     }
 
     /* Nothing came ready */
-    if (select_ret == 0) {
+    if (select_ret <= 0) {
       continue;
     }
 
+
+    /* Select says we have a message, grab it */
     if ((msgsize = recvfrom(sock_fh, buffer, BUFFSIZE, 0,
 			    (struct sockaddr *)&peer_addrin,
 			    &peeraddrlen)) == -1) {
@@ -127,4 +161,10 @@ int main(int argc, char * const argv[]) {
     close(sock_fh);
 
   return 0;
+}
+
+
+void sig_stop_listen(int signo) {
+  /* It is dangerous to do much more than this in a signal handler */
+  listen_stop = 1;
 }
