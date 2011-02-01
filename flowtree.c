@@ -4,6 +4,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <stdint.h>
 #include <signal.h>
 #include <errno.h>
 
@@ -28,15 +29,58 @@
 /* The listen loop */
 int listen_stop = 0;
 
-
+/* Network stuff */
 #define BINDADDR "132.239.1.114"
 #define BINDPORT 2055
 #define SOCKBUFF 1024 * 1024 /* 1 MB */
 #define BUFFSIZE 65536
 
+
+/* ===
+ * Netflow structs
+ * http://www.cisco.com/en/US/docs/net_mgmt/netflow_collection_engine/
+ * 3.6/user/guide/format.html#wp1006108
+ * ===
+ */
+struct netflow_v5 {
+  uint16_t version;
+  uint16_t count;
+  time_t uptime;
+  struct timespec timestamp;
+  uint32_t flow_sequence;
+  uint8_t engine_type;
+  uint8_t engine_id;
+  uint16_t sample_rate;
+};
+
+struct netflow_v5_record {
+  in_addr_t src_addr;
+  in_addr_t dst_addr;
+  in_addr_t next_hop;
+  uint16_t int_in; 
+  uint16_t int_out;
+  uint32_t num_packets;
+  uint32_t num_bytes;
+  time_t start_time;
+  time_t end_time;
+  uint16_t src_port;
+  uint16_t dst_port;
+  uint8_t pad1;
+  uint8_t tcp_flags;
+  uint8_t protocol;
+  uint8_t tos;
+  uint16_t src_as;
+  uint16_t dst_as;
+  uint8_t src_mask;
+  uint8_t dst_mask;
+  uint8_t pad2;
+};  
+
+
 /* Function prototypes */
 int main(int, char * const []);
 void sig_stop_listen(int);
+void flow_callback(const struct sockaddr_in *, const u_char *, size_t);
 
 
 int main(int argc, char * const argv[]) {
@@ -54,7 +98,7 @@ int main(int argc, char * const argv[]) {
   socklen_t peeraddrlen = sizeof(peer_addrin);
 
   /* Network data */
-  char buffer[BUFFSIZE];
+  u_char buffer[BUFFSIZE];
   ssize_t msgsize;
   fd_set read_fd;
   struct timespec sel_timespec;
@@ -136,7 +180,7 @@ int main(int argc, char * const argv[]) {
       }
     }
 
-    /* Nothing came ready */
+    /* Nothing became ready */
     if (select_ret <= 0) {
       continue;
     }
@@ -154,13 +198,23 @@ int main(int argc, char * const argv[]) {
       fprintf(stderr, "Got a packet from %s:%d; size=%d\n",
 	      inet_ntoa(peer_addrin.sin_addr), ntohs(peer_addrin.sin_port),
 	      (int)msgsize);
+
+      flow_callback(&peer_addrin, buffer, msgsize);
     }
     
   }
 
-    close(sock_fh);
+  close(sock_fh);
 
   return 0;
+}
+
+
+void flow_callback(const struct sockaddr_in *peer,
+		   const u_char *flow, size_t flow_size) {
+
+  
+
 }
 
 
