@@ -37,21 +37,22 @@ int listen_stop = 0;
 
 
 /* ===
- * Netflow structs
+ * Netflow structs and other values
  * http://www.cisco.com/en/US/docs/net_mgmt/netflow_collection_engine/
  * 3.6/user/guide/format.html#wp1006108
  * ===
  */
 struct netflow_v5 {
   uint16_t version;
-  uint16_t count;
-  time_t uptime;
-  struct timespec timestamp;
+  uint16_t flow_count;
+  uint32_t uptime;
+  uint32_t unix_sec;
+  uint32_t nsec;
   uint32_t flow_sequence;
   uint8_t engine_type;
   uint8_t engine_id;
   uint16_t sample_rate;
-};
+} __attribute__((__packed__));
 
 struct netflow_v5_record {
   in_addr_t src_addr;
@@ -61,8 +62,8 @@ struct netflow_v5_record {
   uint16_t int_out;
   uint32_t num_packets;
   uint32_t num_bytes;
-  time_t start_time;
-  time_t end_time;
+  uint32_t start_time;
+  uint32_t end_time;
   uint16_t src_port;
   uint16_t dst_port;
   uint8_t pad1;
@@ -73,8 +74,27 @@ struct netflow_v5_record {
   uint16_t dst_as;
   uint8_t src_mask;
   uint8_t dst_mask;
-  uint8_t pad2;
-};  
+  uint16_t pad2;
+} __attribute__((__packed__));  
+
+
+/* ===
+ * The unified flow struct that all other formats will be converted to
+ * ===
+ */
+struct unified_flow {
+  in_addr_t flow_src;
+  in_addr_t src_addr;
+  in_addr_t dst_addr;
+  uint8_t protocol;
+  uint16_t src_port;
+  uint16_t dst_port;
+  uint8_t tcp_flags;
+  uint32_t num_packets;
+  uint32_t num_bytes;
+  time_t start_time;
+  time_t end_time;
+};
 
 
 /* Function prototypes */
@@ -195,9 +215,9 @@ int main(int argc, char * const argv[]) {
       return 1;
     }
     else {
-      fprintf(stderr, "Got a packet from %s:%d; size=%d\n",
+      /*fprintf(stderr, "Got a packet from %s:%d; size=%d\n",
 	      inet_ntoa(peer_addrin.sin_addr), ntohs(peer_addrin.sin_port),
-	      (int)msgsize);
+	      (int)msgsize);*/
 
       flow_callback(&peer_addrin, buffer, msgsize);
     }
@@ -213,8 +233,74 @@ int main(int argc, char * const argv[]) {
 void flow_callback(const struct sockaddr_in *peer,
 		   const u_char *flow, size_t flow_size) {
 
-  
+  struct unified_flow current_flow;
+  struct netflow_v5_record * record_v5;
 
+  /* ===
+   * Misc vars
+   * ===
+   */
+  int records = 0;
+  int i;
+  struct in_addr temp_inaddr_src, temp_inaddr_dst;
+
+  /* ===
+   * Check if it looks like we have a netflow v5 record
+   * Other version of netflow / sflow / jflow will be handled later
+   * === 
+   */
+  if (flow_size < sizeof(struct netflow_v5)) {
+      fprintf(stderr, "not big enough\n");
+    return;
+  }
+
+  if (ntohs(((struct netflow_v5 *)flow)->version) != 5) {
+    fprintf(stderr, "not v5\n");
+    return;
+  }
+
+  records = ntohs(((struct netflow_v5 *)flow)->flow_count);
+  if (flow_size != sizeof(struct netflow_v5) +
+      (records * sizeof(struct netflow_v5_record))) {
+    
+    fprintf(stderr,
+	    "wrong size; flow_count=%d; flow_size=%d; v5=%d, v5r=%d\n",
+	    (int)ntohs(((struct netflow_v5 *)flow)->flow_count),
+	    (int)flow_size, (int)sizeof(struct netflow_v5),
+	    (int)sizeof(struct netflow_v5_record));
+    return;
+  }
+  /*fprintf(stderr, "Got a valid looking netflow v5 packet\n");*/
+  
+  /* Now loop through the records */
+  record_v5 = (struct netflow_v5_record *)(flow + sizeof(struct netflow_v5));
+  for (i = 0; i < records; i++) {
+    
+
+    /* Fill in our current flow info */
+    current_flow.flow_src = peer->sin_addr.s_addr;
+    current_flow.src_addr = ntohl(record_v5[i].src_addr);
+    current_flow.dst_addr = ntohl(record_v5[i].dst_addr);
+    current_flow.protocol = record_v5[i].protocol;
+    current_flow.src_port = ntohs(record_v5[i].src_port);
+    current_flow.dst_port = ntohs(record_v5[i].dst_port);
+    current_flow.tcp_flags = record_v5[i].tcp_flags;
+    current_flow.num_packets = ntohl(record_v5[i].num_packets);
+    current_flow.num_bytes = ntohl(record_v5[i].num_bytes);
+    current_flow.start_time = ntohl(record_v5[i].start_time);
+    current_flow.end_time = ntohl(record_v5[i].end_time);
+
+    temp_inaddr_src.s_addr = ntohl(current_flow.src_addr);
+    temp_inaddr_dst.s_addr = ntohl(current_flow.dst_addr);
+    fprintf(stderr, "Got proto %d flow from %s:%d",
+	    current_flow.protocol,
+	    inet_ntoa(temp_inaddr_src),
+	    current_flow.src_port);
+    fprintf(stderr, " to %s:%d\n",
+	    inet_ntoa(temp_inaddr_dst),
+	    current_flow.dst_port);    
+
+  }
 }
 
 
