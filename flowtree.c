@@ -84,8 +84,8 @@ struct netflow_v5_record {
  */
 struct unified_flow {
   in_addr_t flow_src;
-  in_addr_t src_addr;
-  in_addr_t dst_addr;
+  struct in_addr src_addr;
+  struct in_addr dst_addr;
   uint8_t protocol;
   uint16_t src_port;
   uint16_t dst_port;
@@ -97,10 +97,55 @@ struct unified_flow {
 };
 
 
-/* Function prototypes */
+/* ===
+ * The flow summary to insert into the flow trees
+ * ===
+ */
+struct flow_summary {
+  uint8_t protocol;
+  struct in_addr src_addr;
+  struct in_addr dst_addr;
+  uint16_t src_port;
+  uint16_t dst_port;
+  uint8_t tcp_flags;
+  time_t start_time;
+  time_t end_time;
+};
+
+
+#define TREES 65536
+struct pavl_table *flow_tree[TREES];  
+
+#define ROL16(x, a) ((((x) << (a))  & 0xFFFF) | (((x) & 0xFFFF) >> (16 - (a))))
+
+#define TREEHASH(f) (((((struct flow_summary *)				\
+			(f))->src_addr.s_addr) &			\
+		      0xFFFF) ^						\
+		     (ROL16((((((struct flow_summary *)			\
+				(f))->src_addr.s_addr) &		\
+			      0xFFFF0000) >> 16), 7)) ^			\
+		     ((((struct flow_summary *)				\
+			(f))->dst_addr.s_addr) &			\
+		      0xFFFF) ^						\
+		     (ROL16((((((struct flow_summary *)			\
+				(f))->dst_addr.s_addr) &		\
+			      0xFFFF0000) >> 16), 13)) ^		\
+		     (((struct flow_summary *)				\
+		       (f))->src_port) ^				\
+		     (ROL16((((struct flow_summary *)			\
+			      (f))->dst_port), 3)) ^			\
+		     (((struct flow_summary *)(f))->protocol))
+
+
+/* ===
+ * Function prototypes
+ * ===
+ */
 int main(int, char * const []);
 void sig_stop_listen(int);
 void flow_callback(const struct sockaddr_in *, const u_char *, size_t);
+int compare_flows(const void *, const void *, void *);
+void * copy_flow(const void *, void *);
 
 
 int main(int argc, char * const argv[]) {
@@ -117,12 +162,15 @@ int main(int argc, char * const argv[]) {
   socklen_t sockbufflen = sizeof(getsockbuff);
   socklen_t peeraddrlen = sizeof(peer_addrin);
 
-  /* Network data */
+  /* === Network data vars === */
   u_char buffer[BUFFSIZE];
   ssize_t msgsize;
   fd_set read_fd;
   struct timespec sel_timespec;
   int select_ret;
+
+  /* === Misc vars === */
+  int i;
 
   /* Before we start listening we need to setup a signal
    * handler so we can cleanly exit */
@@ -177,6 +225,12 @@ int main(int argc, char * const argv[]) {
     perror("bind");
     return 1;
   }  
+
+
+  /* Create the flow trees */
+  for (i = 0; i < TREES; i++) {
+    flow_tree[i] = pavl_create(compare_flows, NULL, NULL);
+  }
 
 
   /* Testing receive, will do better in final code */
@@ -237,6 +291,15 @@ void flow_callback(const struct sockaddr_in *peer,
   struct netflow_v5_record * record_v5;
 
   /* ===
+   * Flow tree and summary vars
+   * ===
+   */
+  struct flow_summary cur_flow_summary;
+  struct flow_summary *flow_summary_copy;
+  struct flow_summary **flow_summary_probe;
+  int tree_num;
+
+  /* ===
    * Misc vars
    * ===
    */
@@ -276,11 +339,10 @@ void flow_callback(const struct sockaddr_in *peer,
   record_v5 = (struct netflow_v5_record *)(flow + sizeof(struct netflow_v5));
   for (i = 0; i < records; i++) {
     
-
     /* Fill in our current flow info */
     current_flow.flow_src = peer->sin_addr.s_addr;
-    current_flow.src_addr = ntohl(record_v5[i].src_addr);
-    current_flow.dst_addr = ntohl(record_v5[i].dst_addr);
+    current_flow.src_addr.s_addr = ntohl(record_v5[i].src_addr);
+    current_flow.dst_addr.s_addr = ntohl(record_v5[i].dst_addr);
     current_flow.protocol = record_v5[i].protocol;
     current_flow.src_port = ntohs(record_v5[i].src_port);
     current_flow.dst_port = ntohs(record_v5[i].dst_port);
@@ -290,8 +352,9 @@ void flow_callback(const struct sockaddr_in *peer,
     current_flow.start_time = ntohl(record_v5[i].start_time);
     current_flow.end_time = ntohl(record_v5[i].end_time);
 
-    temp_inaddr_src.s_addr = ntohl(current_flow.src_addr);
-    temp_inaddr_dst.s_addr = ntohl(current_flow.dst_addr);
+    temp_inaddr_src.s_addr = htonl(current_flow.src_addr.s_addr);
+    temp_inaddr_dst.s_addr = htonl(current_flow.dst_addr.s_addr);
+    /*
     fprintf(stderr, "Got proto %d flow from %s:%d",
 	    current_flow.protocol,
 	    inet_ntoa(temp_inaddr_src),
@@ -299,6 +362,51 @@ void flow_callback(const struct sockaddr_in *peer,
     fprintf(stderr, " to %s:%d\n",
 	    inet_ntoa(temp_inaddr_dst),
 	    current_flow.dst_port);    
+    */
+
+
+    /* Setup the current flow summary struct */
+    cur_flow_summary.protocol = current_flow.protocol;
+    cur_flow_summary.src_addr = current_flow.src_addr;
+    cur_flow_summary.dst_addr = current_flow.dst_addr;
+    cur_flow_summary.src_port = current_flow.src_port;
+    cur_flow_summary.dst_port = current_flow.dst_port;
+    cur_flow_summary.tcp_flags = current_flow.tcp_flags;
+    cur_flow_summary.start_time = current_flow.start_time;
+    cur_flow_summary.end_time = current_flow.end_time;
+
+    /* Now make an insert-ready copy */
+    flow_summary_copy = copy_flow(&cur_flow_summary, NULL);
+
+    /* Figure out which tree to use */
+    tree_num = TREEHASH(flow_summary_copy);
+   
+    /* Search and possibly insert this flow */
+    flow_summary_probe =
+      (struct flow_summary **)pavl_probe(flow_tree[tree_num],
+					 flow_summary_copy);
+
+    /* Figure out what happened */
+    if (flow_summary_probe == NULL) {
+      fprintf(stderr, "There was a failure inserting the flow into tree.\n");
+      return;
+    }
+
+
+    /* Now find out if it was already there or we just inserted it */
+    if (*flow_summary_probe == flow_summary_copy) {
+      /* well that was easy, nothing to do now */
+    }
+    else {
+      fprintf(stderr, "Flow already in tree; flows=%u\n",
+	      (unsigned int)pavl_count(flow_tree[tree_num]));
+      
+      /* update some summay stuff about this flow */
+      
+      /* We don't need the copy anymore */
+      free(flow_summary_copy);
+      flow_summary_copy = NULL;
+    }
 
   }
 }
@@ -307,4 +415,60 @@ void flow_callback(const struct sockaddr_in *peer,
 void sig_stop_listen(int signo) {
   /* It is dangerous to do much more than this in a signal handler */
   listen_stop = 1;
+}
+
+
+int compare_flows(const void *a, const void *b, void *param) {
+
+  const struct flow_summary *fa = a;
+  const struct flow_summary *fb = b;
+
+  if (fa->protocol > fb->protocol) {
+    return 1;
+  }
+  else if (fa->protocol < fb->protocol) {
+    return -1;
+  }
+  else if (fa->src_addr.s_addr > fb->src_addr.s_addr) {
+    return 1;
+  }
+  else if (fa->src_addr.s_addr < fb->src_addr.s_addr) {
+    return -1;
+  }
+  else if (fa->dst_addr.s_addr > fb->dst_addr.s_addr) {
+    return 1;
+  }
+  else if (fa->dst_addr.s_addr < fb->dst_addr.s_addr) {
+    return -1;
+  }
+  else if (fa->src_port > fb->src_port) {
+    return 1;
+  }
+  else if (fa->src_port < fb->src_port) {
+    return -1;
+  }
+  else if (fa->dst_port > fb->dst_port) {
+    return 1;
+  }
+  else if (fa->dst_port < fb->dst_port) {
+    return -1;
+  }
+  else {
+    return 0;
+  }
+}
+
+
+void * copy_flow(const void *a, void *param) {
+  
+  struct flow_summary * f = malloc(sizeof(struct flow_summary));
+
+  if (f == NULL) {
+    return NULL;
+  }
+  else {
+    memcpy(f, a, sizeof(struct flow_summary));
+  }
+  
+  return f;
 }
