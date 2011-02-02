@@ -60,8 +60,8 @@ struct netflow_v5_record {
   in_addr_t src_addr;
   in_addr_t dst_addr;
   in_addr_t next_hop;
-  uint16_t int_in; 
-  uint16_t int_out;
+  uint16_t src_int; 
+  uint16_t dst_int;
   uint32_t num_packets;
   uint32_t num_bytes;
   uint32_t start_time;
@@ -80,12 +80,50 @@ struct netflow_v5_record {
 } __attribute__((__packed__));  
 
 
+/* === Netflow v7 === */
+struct netflow_v7 {
+  uint16_t version;
+  uint16_t flow_count;
+  uint32_t uptime;
+  uint32_t unix_sec;
+  uint32_t nsec;
+  uint32_t flow_sequence;
+  uint32_t reserved;
+} __attribute__((__packed__));
+
+struct netflow_v7_record {
+  in_addr_t src_addr;
+  in_addr_t dst_addr;
+  in_addr_t next_hop;
+  uint16_t src_int; 
+  uint16_t dst_int;
+  uint32_t num_packets;
+  uint32_t num_bytes;
+  uint32_t start_time;
+  uint32_t end_time;
+  uint16_t src_port;
+  uint16_t dst_port;
+  uint8_t flags1;
+  uint8_t tcp_flags;
+  uint8_t protocol;
+  uint8_t tos;
+  uint16_t src_as;
+  uint16_t dst_as;
+  uint8_t src_mask;
+  uint8_t dst_mask;
+  uint16_t flags2;
+  uint16_t flow_src;
+} __attribute__((__packed__));  
+
+
 /* ===
  * The unified flow struct that all other formats will be converted to
  * ===
  */
 struct unified_flow {
   in_addr_t flow_src;
+  uint16_t src_int;
+  uint16_t dst_int;
   struct in_addr src_addr;
   struct in_addr dst_addr;
   uint8_t protocol;
@@ -105,6 +143,8 @@ struct unified_flow {
  */
 struct flow_source_summary {
   in_addr_t flow_src;
+  uint16_t src_int;
+  uint16_t dst_int;
   uint64_t num_packets;
   uint64_t num_bytes;  
   uint64_t num_flows;  
@@ -163,7 +203,7 @@ uint64_t stat_icmp_flows, stat_tcp_flows, stat_udp_flows, stat_other_flows;
  */
 int main(int, char * const []);
 void sig_stop_listen(int);
-void flow_callback(const struct sockaddr_in *, const u_char *, size_t);
+void packet_callback(const struct sockaddr_in *, const u_char *, size_t);
 int compare_flows(const void *, const void *, void *);
 void * copy_flow(const void *, void *);
 
@@ -293,7 +333,7 @@ int main(int argc, char * const argv[]) {
 	      inet_ntoa(peer_addrin.sin_addr), ntohs(peer_addrin.sin_port),
 	      (int)msgsize);*/
 
-      flow_callback(&peer_addrin, buffer, msgsize);
+      packet_callback(&peer_addrin, buffer, msgsize);
     }
     
   }
@@ -304,8 +344,8 @@ int main(int argc, char * const argv[]) {
 }
 
 
-void flow_callback(const struct sockaddr_in *peer,
-		   const u_char *flow, size_t flow_size) {
+void packet_callback(const struct sockaddr_in *peer,
+		     const u_char *flow, size_t flow_size) {
 
   struct unified_flow current_flow;
   struct netflow_v5_record * record_v5;
@@ -370,6 +410,8 @@ void flow_callback(const struct sockaddr_in *peer,
     
     /* Fill in our current flow info */
     current_flow.flow_src = peer->sin_addr.s_addr;
+    current_flow.src_int = ntohs(record_v5[i].src_int);
+    current_flow.dst_int = ntohs(record_v5[i].dst_int);
     current_flow.src_addr.s_addr = ntohl(record_v5[i].src_addr);
     current_flow.dst_addr.s_addr = ntohl(record_v5[i].dst_addr);
     current_flow.protocol = record_v5[i].protocol;
@@ -531,6 +573,8 @@ void flow_callback(const struct sockaddr_in *peer,
 
       /* Set the new fields */
       new_flow_source_summary->flow_src = current_flow.flow_src;
+      new_flow_source_summary->src_int = current_flow.src_int;
+      new_flow_source_summary->dst_int = current_flow.dst_int;
       new_flow_source_summary->num_packets = current_flow.num_packets;
       new_flow_source_summary->num_bytes = current_flow.num_bytes;
       new_flow_source_summary->num_flows = 1;
