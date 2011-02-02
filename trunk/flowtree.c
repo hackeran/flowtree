@@ -112,7 +112,7 @@ struct netflow_v7_record {
   uint8_t src_mask;
   uint8_t dst_mask;
   uint16_t flags2;
-  uint16_t flow_src;
+  uint32_t flow_src;
 } __attribute__((__packed__));  
 
 
@@ -174,6 +174,8 @@ void sig_stop_listen(int);
 void packet_callback(const struct sockaddr_in *, const u_char *, const size_t);
 void flow_callback(const struct unified_flow *);
 void parse_netflow_v5(const struct sockaddr_in *,
+		      const u_char *, const size_t);
+void parse_netflow_v7(const struct sockaddr_in *,
 		      const u_char *, const size_t);
 int compare_flows(const void *, const void *, void *);
 void * copy_flow(const void *, void *);
@@ -364,6 +366,16 @@ void packet_callback(const struct sockaddr_in *peer,
     }
   }
 
+  /* Check for netflow v7 */
+  if (flow_size > sizeof(struct netflow_v7)) {
+    if (ntohs(((struct netflow_v7 *)flow)->version) == 7) {
+      /* Maybe more checks should be added later... */
+
+      parse_netflow_v7(peer, flow, flow_size);
+      return;
+    }
+  }
+
   /* Other version of netflow / sflow / jflow will be handled later */
   fprintf(stderr, "Got an uknown flow format\n");
 
@@ -389,7 +401,7 @@ void parse_netflow_v5(const struct sockaddr_in *peer,
    * === 
    */
   if (flow_size < sizeof(struct netflow_v5)) {
-    fprintf(stderr, "not big enough\n");
+    fprintf(stderr, "v5 flow not big enough\n");
     return;
   }
 
@@ -443,6 +455,85 @@ void parse_netflow_v5(const struct sockaddr_in *peer,
     current_flow.end_time = ntohl(((struct netflow_v5 *)flow)->unix_sec) -
       (((ntohl(((struct netflow_v5 *)flow)->uptime) -		\
 	 ntohl(record_v5[i].end_time)) & 0xFFFFFFFF) / 1000);
+
+    /* Now handle the current unified flow */
+    flow_callback(&current_flow);
+  }
+}
+
+
+void parse_netflow_v7(const struct sockaddr_in *peer,
+		      const u_char *flow, const size_t flow_size) {
+
+  struct unified_flow current_flow;
+  struct netflow_v7_record * record_v7;
+
+  /* ===
+   * Misc vars
+   * ===
+   */
+  int records = 0;
+  int i;
+
+  /* ===
+   * Do more sanity checks to make sure we have a netflow v7 record
+   * === 
+   */
+  if (flow_size < sizeof(struct netflow_v7)) {
+    fprintf(stderr, "v7 flow not big enough\n");
+    return;
+  }
+
+  if (ntohs(((struct netflow_v7 *)flow)->version) != 7) {
+    fprintf(stderr, "not v7\n");
+    return;
+  }
+
+  records = ntohs(((struct netflow_v7 *)flow)->flow_count);
+  if (flow_size != sizeof(struct netflow_v7) +
+      (records * sizeof(struct netflow_v7_record))) {
+    
+    fprintf(stderr,
+	    "wrong size; flow_count=%d; flow_size=%d; v7=%d, v7r=%d\n",
+	    (int)ntohs(((struct netflow_v7 *)flow)->flow_count),
+	    (int)flow_size, (int)sizeof(struct netflow_v7),
+	    (int)sizeof(struct netflow_v7_record));
+    return;
+  }
+  /*fprintf(stderr, "Got a valid looking netflow v7 packet\n");*/
+  
+
+  /* ===
+   * Looks like valid netflow v7 so parse it
+   * === 
+   */
+  
+  /* Now loop through the records */
+  record_v7 = (struct netflow_v7_record *)(flow + sizeof(struct netflow_v7));
+  for (i = 0; i < records; i++) {
+    
+    /* Fill in our current flow info */
+    current_flow.flow_src = ntohl(record_v7[i].flow_src);
+    current_flow.src_int = ntohs(record_v7[i].src_int);
+    current_flow.dst_int = ntohs(record_v7[i].dst_int);
+    current_flow.src_addr.s_addr = ntohl(record_v7[i].src_addr);
+    current_flow.dst_addr.s_addr = ntohl(record_v7[i].dst_addr);
+    current_flow.protocol = record_v7[i].protocol;
+    current_flow.src_port = ntohs(record_v7[i].src_port);
+    current_flow.dst_port = ntohs(record_v7[i].dst_port);
+    current_flow.tcp_flags = record_v7[i].tcp_flags;
+    current_flow.num_packets = ntohl(record_v7[i].num_packets);
+    current_flow.num_bytes = ntohl(record_v7[i].num_bytes);
+
+    /* Time calculations require a bit of math, namely
+     * curtime - ((uptime - start) / 1000)
+     */
+    current_flow.start_time = ntohl(((struct netflow_v7 *)flow)->unix_sec) -
+      (((ntohl(((struct netflow_v7 *)flow)->uptime) -		\
+	 ntohl(record_v7[i].start_time)) & 0xFFFFFFFF) / 1000);
+    current_flow.end_time = ntohl(((struct netflow_v7 *)flow)->unix_sec) -
+      (((ntohl(((struct netflow_v7 *)flow)->uptime) -		\
+	 ntohl(record_v7[i].end_time)) & 0xFFFFFFFF) / 1000);
 
     /* Now handle the current unified flow */
     flow_callback(&current_flow);
