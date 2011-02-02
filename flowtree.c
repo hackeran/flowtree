@@ -42,6 +42,8 @@ int listen_stop = 0;
  * 3.6/user/guide/format.html#wp1006108
  * ===
  */
+
+/* === Netflow v5 === */
 struct netflow_v5 {
   uint16_t version;
   uint16_t flow_count;
@@ -379,14 +381,14 @@ void flow_callback(const struct sockaddr_in *peer,
 
 
     /* Time calculations require a bit of math, namely
-     * curtime - ((uptime - start) / 10)
+     * curtime - ((uptime - start) / 1000)
      */
     current_flow.start_time = ntohl(((struct netflow_v5 *)flow)->unix_sec) -
       (((ntohl(((struct netflow_v5 *)flow)->uptime) -		\
-	 ntohl(record_v5[i].start_time)) & 0xFFFFFFFF) / 10);
+	 ntohl(record_v5[i].start_time)) & 0xFFFFFFFF) / 1000);
     current_flow.end_time = ntohl(((struct netflow_v5 *)flow)->unix_sec) -
       (((ntohl(((struct netflow_v5 *)flow)->uptime) -		\
-	 ntohl(record_v5[i].end_time)) & 0xFFFFFFFF) / 10);
+	 ntohl(record_v5[i].end_time)) & 0xFFFFFFFF) / 1000);
 
     temp_inaddr_src.s_addr = htonl(current_flow.src_addr.s_addr);
     temp_inaddr_dst.s_addr = htonl(current_flow.dst_addr.s_addr);
