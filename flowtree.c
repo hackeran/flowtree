@@ -122,6 +122,7 @@ struct netflow_v7_record {
  */
 struct unified_flow {
   in_addr_t flow_src;
+  time_t recv_time;
   uint16_t src_int;
   uint16_t dst_int;
   struct in_addr src_addr;
@@ -152,9 +153,11 @@ struct flow_source_summary {
 };
 
 struct flow_summary {
-  uint8_t protocol;
+  time_t time_added;
+  time_t time_updated;
   struct in_addr src_addr;
   struct in_addr dst_addr;
+  uint8_t protocol;
   uint16_t src_port;
   uint16_t dst_port;
   uint8_t tcp_flags;
@@ -171,12 +174,13 @@ struct flow_summary {
  */
 int main(int, char * const []);
 void sig_stop_listen(int);
-void packet_callback(const struct sockaddr_in *, const u_char *, const size_t);
+void packet_callback(const struct sockaddr_in *, const u_char *,
+		     const size_t, const time_t);
+void parse_netflow_v5(const struct sockaddr_in *, const u_char *,
+		      const size_t, const time_t);
+void parse_netflow_v7(const struct sockaddr_in *, const u_char *,
+		      const size_t, const time_t);
 void flow_callback(const struct unified_flow *);
-void parse_netflow_v5(const struct sockaddr_in *,
-		      const u_char *, const size_t);
-void parse_netflow_v7(const struct sockaddr_in *,
-		      const u_char *, const size_t);
 int compare_flows(const void *, const void *, void *);
 void * copy_flow(const void *, void *);
 
@@ -213,8 +217,19 @@ struct pavl_table *flow_tree[TREES];
  * Some stats vars
  * ===
  */
-uint64_t stat_new_flows, stat_dup_flows, stat_current_flows;
-uint64_t stat_icmp_flows, stat_tcp_flows, stat_udp_flows, stat_other_flows;
+uint64_t stat_flow_packets = 0;
+uint64_t stat_new_flows = 0, stat_dup_flows = 0, stat_current_flows = 0;
+uint64_t stat_icmp_flows = 0, stat_tcp_flows = 0, stat_udp_flows = 0;
+uint64_t stat_other_flows = 0;
+
+
+/* ===
+ * The global time vars
+ * ===
+ */
+#define STATS_RATE 60
+time_t last_stats_update;
+time_t start_time;
 
 
 int main(int argc, char * const argv[]) {
@@ -237,8 +252,11 @@ int main(int argc, char * const argv[]) {
   fd_set read_fd;
   struct timespec sel_timespec;
   int select_ret;
+  time_t recv_time;
 
   /* === Misc vars === */
+  time_t cur_time;
+  uint32_t time_diff;
   int i;
 
   /* Before we start listening we need to setup a signal
@@ -301,10 +319,59 @@ int main(int argc, char * const argv[]) {
     flow_tree[i] = pavl_create(compare_flows, NULL, NULL);
   }
 
-
+  /* Record what time we started */
+  start_time = time(NULL);
+  last_stats_update = start_time;
+  
   /* Testing receive, will do better in final code */
   while (listen_stop == 0) {
 
+    /* Check if we need to update the stats */
+    cur_time = time(NULL);
+    time_diff = cur_time - last_stats_update;
+
+    if (time_diff >= STATS_RATE) {
+      last_stats_update = cur_time;
+
+      time_diff = cur_time - start_time;
+
+      if (stat_new_flows == 0) {
+	fprintf(stderr, "--\n");
+	fprintf(stderr, "NO FLOWS\n");
+      }
+      else {
+	fprintf(stderr, "--\n");
+	fprintf(stderr, "flowtree stats:\n");
+	fprintf(stderr, "===============\n");
+	fprintf(stderr, "runtime: %d seconds; total packets: %lu; "
+		"total flows: %lu\n", (int)time_diff,
+		stat_flow_packets, stat_new_flows + stat_dup_flows);
+	fprintf(stderr, "packet rate: %.02f pps; "
+		"flow rate: %.02f fps; new flow rate %.02f fps\n",
+		(double)stat_flow_packets / (double)time_diff,
+		(double)(stat_new_flows + stat_dup_flows) / (double)time_diff,
+		(double)stat_new_flows / (double)time_diff);
+	fprintf(stderr, "unique flows: %lu (%.02f%%)\n",
+		stat_new_flows, ((double)stat_new_flows /
+				 (double)(stat_new_flows +
+					  stat_dup_flows)) * 100);
+	fprintf(stderr, "tcp flows: %lu (%.02f%%)\n",
+		stat_tcp_flows, ((double)stat_tcp_flows /
+				 (double)stat_new_flows) * 100);
+	fprintf(stderr, "udp flows: %lu (%.02f%%)\n",
+		stat_udp_flows, ((double)stat_udp_flows /
+				 (double)stat_new_flows) * 100);
+	fprintf(stderr, "icmp flows: %lu (%.02f%%)\n",
+		stat_icmp_flows, ((double)stat_icmp_flows /
+				  (double)stat_new_flows) * 100);
+	fprintf(stderr, "other flows: %lu (%.02f%%)\n",
+		stat_other_flows, ((double)stat_other_flows /
+				   (double)stat_new_flows) * 100);
+      }
+    }
+
+
+    /* prep for the select */
     FD_ZERO(&read_fd);
     FD_SET(sock_fh, &read_fd);
     sel_timespec.tv_sec = 0;
@@ -342,7 +409,11 @@ int main(int argc, char * const argv[]) {
 	      inet_ntoa(peer_addrin.sin_addr), ntohs(peer_addrin.sin_port),
 	      (int)msgsize);*/
 
-      packet_callback(&peer_addrin, buffer, msgsize);
+      /* Update the counter */
+      stat_flow_packets += 1;
+
+      recv_time = time(NULL);
+      packet_callback(&peer_addrin, buffer, msgsize, recv_time);
     }
     
   }
@@ -353,15 +424,15 @@ int main(int argc, char * const argv[]) {
 }
 
 
-void packet_callback(const struct sockaddr_in *peer,
-		     const u_char *flow, const size_t flow_size) {
+void packet_callback(const struct sockaddr_in *peer, const u_char *flow,
+		     const size_t flow_size, const time_t recv_time) {
 
   /* Check for netflow v5 */
   if (flow_size > sizeof(struct netflow_v5)) {
     if (ntohs(((struct netflow_v5 *)flow)->version) == 5) {
       /* Maybe more checks should be added later... */
 
-      parse_netflow_v5(peer, flow, flow_size);
+      parse_netflow_v5(peer, flow, flow_size, recv_time);
       return;
     }
   }
@@ -371,7 +442,7 @@ void packet_callback(const struct sockaddr_in *peer,
     if (ntohs(((struct netflow_v7 *)flow)->version) == 7) {
       /* Maybe more checks should be added later... */
 
-      parse_netflow_v7(peer, flow, flow_size);
+      parse_netflow_v7(peer, flow, flow_size, recv_time);
       return;
     }
   }
@@ -383,8 +454,8 @@ void packet_callback(const struct sockaddr_in *peer,
 }
 
 
-void parse_netflow_v5(const struct sockaddr_in *peer,
-		      const u_char *flow, const size_t flow_size) {
+void parse_netflow_v5(const struct sockaddr_in *peer, const u_char *flow,
+		      const size_t flow_size, const time_t recv_time) {
 
   struct unified_flow current_flow;
   struct netflow_v5_record * record_v5;
@@ -435,6 +506,7 @@ void parse_netflow_v5(const struct sockaddr_in *peer,
     
     /* Fill in our current flow info */
     current_flow.flow_src = peer->sin_addr.s_addr;
+    current_flow.recv_time = recv_time;
     current_flow.src_int = ntohs(record_v5[i].src_int);
     current_flow.dst_int = ntohs(record_v5[i].dst_int);
     current_flow.src_addr.s_addr = ntohl(record_v5[i].src_addr);
@@ -462,8 +534,8 @@ void parse_netflow_v5(const struct sockaddr_in *peer,
 }
 
 
-void parse_netflow_v7(const struct sockaddr_in *peer,
-		      const u_char *flow, const size_t flow_size) {
+void parse_netflow_v7(const struct sockaddr_in *peer, const u_char *flow,
+		      const size_t flow_size, const time_t recv_time) {
 
   struct unified_flow current_flow;
   struct netflow_v7_record * record_v7;
@@ -514,6 +586,7 @@ void parse_netflow_v7(const struct sockaddr_in *peer,
     
     /* Fill in our current flow info */
     current_flow.flow_src = ntohl(record_v7[i].flow_src);
+    current_flow.recv_time = recv_time;
     current_flow.src_int = ntohs(record_v7[i].src_int);
     current_flow.dst_int = ntohs(record_v7[i].dst_int);
     current_flow.src_addr.s_addr = ntohl(record_v7[i].src_addr);
@@ -582,9 +655,11 @@ void flow_callback(const struct unified_flow *current_flow) {
    */
 
   /* Setup the current flow summary struct */
-  cur_flow_summary.protocol = current_flow->protocol;
+  cur_flow_summary.time_added = current_flow->recv_time;
+  cur_flow_summary.time_updated = current_flow->recv_time;
   cur_flow_summary.src_addr = current_flow->src_addr;
   cur_flow_summary.dst_addr = current_flow->dst_addr;
+  cur_flow_summary.protocol = current_flow->protocol;
   cur_flow_summary.src_port = current_flow->src_port;
   cur_flow_summary.dst_port = current_flow->dst_port;
   cur_flow_summary.tcp_flags = current_flow->tcp_flags;
@@ -648,9 +723,12 @@ void flow_callback(const struct unified_flow *current_flow) {
     if ((*flow_summary_probe)->end_time < flow_summary_copy->end_time) {
       (*flow_summary_probe)->end_time = flow_summary_copy->end_time;
     }
-      
+    (*flow_summary_probe)->time_updated = flow_summary_copy->time_updated;
+   
+    /*
     fprintf(stderr, "Sources: %d\n",
 	    (*flow_summary_probe)->source_count);
+    */
     
     /* We don't need the copy anymore */
     free(flow_summary_copy);
