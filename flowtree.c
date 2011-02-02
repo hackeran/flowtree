@@ -101,6 +101,14 @@ struct unified_flow {
  * The flow summary to insert into the flow trees
  * ===
  */
+struct flow_source_summary {
+  in_addr_t flow_src;
+  uint64_t num_packets;
+  uint64_t num_bytes;  
+  uint64_t num_flows;  
+  struct flow_source_summary *next;
+};
+
 struct flow_summary {
   uint8_t protocol;
   struct in_addr src_addr;
@@ -110,6 +118,8 @@ struct flow_summary {
   uint8_t tcp_flags;
   time_t start_time;
   time_t end_time;
+  uint8_t source_count;
+  struct flow_source_summary *sources;
 };
 
 
@@ -135,6 +145,14 @@ struct pavl_table *flow_tree[TREES];
 		     (ROL16((((struct flow_summary *)			\
 			      (f))->dst_port), 3)) ^			\
 		     (((struct flow_summary *)(f))->protocol))
+
+
+/* ===
+ * Some stats vars
+ * ===
+ */
+uint64_t stat_new_flows, stat_dup_flows, stat_current_flows;
+uint64_t stat_icmp_flows, stat_tcp_flows, stat_udp_flows, stat_other_flows;
 
 
 /* ===
@@ -297,6 +315,8 @@ void flow_callback(const struct sockaddr_in *peer,
   struct flow_summary cur_flow_summary;
   struct flow_summary *flow_summary_copy;
   struct flow_summary **flow_summary_probe;
+  struct flow_source_summary *new_flow_source_summary;
+  struct flow_source_summary **cur_flow_source_summary;
   int tree_num;
 
   /* ===
@@ -306,6 +326,7 @@ void flow_callback(const struct sockaddr_in *peer,
   int records = 0;
   int i;
   struct in_addr temp_inaddr_src, temp_inaddr_dst;
+  int source_updated;
 
   /* ===
    * Check if it looks like we have a netflow v5 record
@@ -335,7 +356,13 @@ void flow_callback(const struct sockaddr_in *peer,
   }
   /*fprintf(stderr, "Got a valid looking netflow v5 packet\n");*/
   
-  /* Now loop through the records */
+
+  /* ===
+   * Looks like valid netflow v5 so parse it
+   * === 
+   */
+  
+/* Now loop through the records */
   record_v5 = (struct netflow_v5_record *)(flow + sizeof(struct netflow_v5));
   for (i = 0; i < records; i++) {
     
@@ -349,21 +376,38 @@ void flow_callback(const struct sockaddr_in *peer,
     current_flow.tcp_flags = record_v5[i].tcp_flags;
     current_flow.num_packets = ntohl(record_v5[i].num_packets);
     current_flow.num_bytes = ntohl(record_v5[i].num_bytes);
-    current_flow.start_time = ntohl(record_v5[i].start_time);
-    current_flow.end_time = ntohl(record_v5[i].end_time);
+
+
+    /* Time calculations require a bit of math, namely
+     * curtime - ((uptime - start) / 10)
+     */
+    current_flow.start_time = ntohl(((struct netflow_v5 *)flow)->unix_sec) -
+      (((ntohl(((struct netflow_v5 *)flow)->uptime) -		\
+	 ntohl(record_v5[i].start_time)) & 0xFFFFFFFF) / 10);
+    current_flow.end_time = ntohl(((struct netflow_v5 *)flow)->unix_sec) -
+      (((ntohl(((struct netflow_v5 *)flow)->uptime) -		\
+	 ntohl(record_v5[i].end_time)) & 0xFFFFFFFF) / 10);
 
     temp_inaddr_src.s_addr = htonl(current_flow.src_addr.s_addr);
     temp_inaddr_dst.s_addr = htonl(current_flow.dst_addr.s_addr);
+
     /*
     fprintf(stderr, "Got proto %d flow from %s:%d",
 	    current_flow.protocol,
 	    inet_ntoa(temp_inaddr_src),
 	    current_flow.src_port);
-    fprintf(stderr, " to %s:%d\n",
+    fprintf(stderr, " to %s:%d (%u to %u)\n",
 	    inet_ntoa(temp_inaddr_dst),
-	    current_flow.dst_port);    
+	    current_flow.dst_port,
+	    (unsigned int)current_flow.start_time,
+	    (unsigned int)current_flow.end_time);
     */
 
+
+  /* ===
+   * Now insert or update the flow in the tree
+   * === 
+   */
 
     /* Setup the current flow summary struct */
     cur_flow_summary.protocol = current_flow.protocol;
@@ -374,6 +418,8 @@ void flow_callback(const struct sockaddr_in *peer,
     cur_flow_summary.tcp_flags = current_flow.tcp_flags;
     cur_flow_summary.start_time = current_flow.start_time;
     cur_flow_summary.end_time = current_flow.end_time;
+    cur_flow_summary.source_count = 1;
+    cur_flow_summary.sources = NULL;
 
     /* Now make an insert-ready copy */
     flow_summary_copy = copy_flow(&cur_flow_summary, NULL);
@@ -395,18 +441,105 @@ void flow_callback(const struct sockaddr_in *peer,
 
     /* Now find out if it was already there or we just inserted it */
     if (*flow_summary_probe == flow_summary_copy) {
-      /* well that was easy, nothing to do now */
+      /* well that was easy, nothing fancy to do now */
+
+      /* should increment new flow counters */
+      stat_new_flows++;
+      stat_current_flows++;
+      if ((*flow_summary_probe)->protocol == 17) {
+	stat_udp_flows++;
+      }
+      else if ((*flow_summary_probe)->protocol == 6) {
+	stat_tcp_flows++;
+      }
+      else if ((*flow_summary_probe)->protocol == 1) {
+	stat_icmp_flows++;
+      }
+      else {
+	stat_other_flows++;
+      }
     }
     else {
-      fprintf(stderr, "Flow already in tree; flows=%u\n",
+      /* fprintf(stderr, "Flow already in tree; flows=%u\n",
 	      (unsigned int)pavl_count(flow_tree[tree_num]));
+      */
+
+      /* update the stats */
+      stat_dup_flows++;
+
       
       /* update some summay stuff about this flow */
+      (*flow_summary_probe)->tcp_flags |= flow_summary_copy->tcp_flags;
+      if ((*flow_summary_probe)->start_time > flow_summary_copy->start_time) {
+	(*flow_summary_probe)->start_time = flow_summary_copy->start_time;
+      }
+      if ((*flow_summary_probe)->end_time < flow_summary_copy->end_time) {
+	(*flow_summary_probe)->end_time = flow_summary_copy->end_time;
+      }
+      
+      /*
+      fprintf(stderr, "Sources: %d\n",
+	      (*flow_summary_probe)->source_count); */
       
       /* We don't need the copy anymore */
       free(flow_summary_copy);
       flow_summary_copy = NULL;
     }
+
+    /*
+    fprintf(stderr, "Stats: new=%lu, dup=%lu, cur=%lu, tcp=%lu, "
+	    "udp=%lu, icmp=%lu; oth=%lu\n",
+	    stat_new_flows, stat_dup_flows, stat_current_flows,
+	    stat_tcp_flows, stat_udp_flows, stat_icmp_flows,
+	    stat_other_flows);
+    */
+
+  /* ===
+   * The flow is now in the tree, we need to update the flow source info
+   * === 
+   */
+
+    /* Find the spot to update or where to insert */
+    source_updated = 0;
+    cur_flow_source_summary = &((*flow_summary_probe)->sources);
+    while (*cur_flow_source_summary != NULL) {
+
+      if (current_flow.flow_src < (*cur_flow_source_summary)->flow_src) {
+	/* We are going to need to insert a new flow source here */
+	break;
+      }
+      else if (current_flow.flow_src == (*cur_flow_source_summary)->flow_src) {
+	/* We need to update this flow source */
+	(*cur_flow_source_summary)->num_packets += current_flow.num_packets;
+	(*cur_flow_source_summary)->num_bytes += current_flow.num_bytes;
+	(*cur_flow_source_summary)->num_flows += 1;
+
+	source_updated = 1;
+	break;
+      }
+      else {
+	/* Go on */
+	cur_flow_source_summary = &((*cur_flow_source_summary)->next);
+      }
+    }
+
+    /* If we didn't do an update then we need to insert a new flow source */
+    if (source_updated == 0) {
+      new_flow_source_summary = malloc(sizeof(struct flow_source_summary));
+
+      /* Set the new fields */
+      new_flow_source_summary->flow_src = current_flow.flow_src;
+      new_flow_source_summary->num_packets = current_flow.num_packets;
+      new_flow_source_summary->num_bytes = current_flow.num_bytes;
+      new_flow_source_summary->num_flows = 1;
+      
+      /* Now insert this into the list */
+      new_flow_source_summary->next = *cur_flow_source_summary;
+      *cur_flow_source_summary = new_flow_source_summary;
+
+      /* Update the source count for the flow */
+      (*flow_summary_probe)->source_count += 1;
+    }	
 
   }
 }
