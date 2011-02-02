@@ -173,6 +173,8 @@ int main(int, char * const []);
 void sig_stop_listen(int);
 void packet_callback(const struct sockaddr_in *, const u_char *, const size_t);
 void flow_callback(const struct unified_flow *);
+void parse_netflow_v5(const struct sockaddr_in *,
+		      const u_char *, const size_t);
 int compare_flows(const void *, const void *, void *);
 void * copy_flow(const void *, void *);
 
@@ -352,6 +354,26 @@ int main(int argc, char * const argv[]) {
 void packet_callback(const struct sockaddr_in *peer,
 		     const u_char *flow, const size_t flow_size) {
 
+  /* Check for netflow v5 */
+  if (flow_size > sizeof(struct netflow_v5)) {
+    if (ntohs(((struct netflow_v5 *)flow)->version) == 5) {
+      /* Maybe more checks should be added later... */
+
+      parse_netflow_v5(peer, flow, flow_size);
+      return;
+    }
+  }
+
+  /* Other version of netflow / sflow / jflow will be handled later */
+  fprintf(stderr, "Got an uknown flow format\n");
+
+
+}
+
+
+void parse_netflow_v5(const struct sockaddr_in *peer,
+		      const u_char *flow, const size_t flow_size) {
+
   struct unified_flow current_flow;
   struct netflow_v5_record * record_v5;
 
@@ -363,12 +385,11 @@ void packet_callback(const struct sockaddr_in *peer,
   int i;
 
   /* ===
-   * Check if it looks like we have a netflow v5 record
-   * Other version of netflow / sflow / jflow will be handled later
+   * Do more sanity checks to make sure we have a netflow v5 record
    * === 
    */
   if (flow_size < sizeof(struct netflow_v5)) {
-      fprintf(stderr, "not big enough\n");
+    fprintf(stderr, "not big enough\n");
     return;
   }
 
@@ -396,7 +417,7 @@ void packet_callback(const struct sockaddr_in *peer,
    * === 
    */
   
-/* Now loop through the records */
+  /* Now loop through the records */
   record_v5 = (struct netflow_v5_record *)(flow + sizeof(struct netflow_v5));
   for (i = 0; i < records; i++) {
     
