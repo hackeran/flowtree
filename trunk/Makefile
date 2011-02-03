@@ -4,7 +4,7 @@ CFLAGS=-Wall -march=native -O3
 #CFLAGS=-Wall -march=native -O2 -pg
 #CFLAGS=-Wall -march=native -O0 -g
 
-LDLIBS=
+LDLIBS=-lpthread
 
 main: flowtree
 

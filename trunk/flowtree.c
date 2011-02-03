@@ -29,8 +29,8 @@
 /* The AVL tree */
 #include "pavl.h"
 
-/* The listen loop */
-int listen_stop = 0;
+/* The listen loop and thread(s) */
+int terminate = 0;
 
 /* Network stuff */
 #define BINDADDR "132.239.1.114"
@@ -189,7 +189,7 @@ struct pavl_table *exclude_tree;
  * ===
  */
 int main(int, char * const []);
-void sig_stop_listen(int);
+void sig_terminate(int);
 void packet_callback(const struct sockaddr_in *, const u_char *,
 		     const size_t, const time_t);
 void parse_netflow_v5(const struct sockaddr_in *, const u_char *,
@@ -202,6 +202,8 @@ int compare_excludes(const void *, const void *, void *);
 void * copy_flow(const void *, void *);
 void add_exclusion(const in_addr_t, const in_addr_t);
 int is_excluded(const in_addr_t);
+void *thread_flow_janitor(void *);
+void free_source_list(struct flow_source_summary *);
 
 
 /* ===
@@ -209,7 +211,19 @@ int is_excluded(const in_addr_t);
  * ===
  */
 #define TREES 65536
-struct pavl_table *flow_tree[TREES];  
+
+struct hash_node_tree {
+  struct pavl_table *tree;
+  pthread_mutex_t tree_mutex;
+};
+
+struct hash_node_tree flow_hash_trees[TREES];  
+
+
+/* === The purge parameters === */
+#define MIN_FLOW_AGE 60
+#define MAX_FLOW_AGE 300
+
 
 #define ROL16(x, a) ((((x) << (a))  & 0xFFFF) | (((x) & 0xFFFF) >> (16 - (a))))
 
@@ -239,6 +253,7 @@ struct pavl_table *flow_tree[TREES];
 uint64_t stat_flow_packets = 0, stat_total_flows = 0, stat_excluded_flows = 0;
 uint64_t stat_new_flows = 0, stat_dup_flows = 0, stat_current_flows = 0;
 uint64_t stat_proto_flows[256];
+pthread_mutex_t stat_current_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 
 /* ===
@@ -272,6 +287,10 @@ int main(int argc, char * const argv[]) {
   int select_ret;
   time_t recv_time;
 
+  /* === Thread vars === */
+  pthread_t flow_janitor;
+  int thread_ret;
+
   /* === Misc vars === */
   time_t cur_time;
   uint32_t time_diff;
@@ -280,10 +299,10 @@ int main(int argc, char * const argv[]) {
   /* Before we start listening we need to setup a signal
    * handler so we can cleanly exit */
   memset(&sa_new, 0, sizeof(struct sigaction));
-  sa_new.sa_handler = sig_stop_listen;
+  sa_new.sa_handler = sig_terminate;
   sigaction(SIGTERM, &sa_new, &sa_old);
   memset(&sa_new, 0, sizeof(struct sigaction));
-  sa_new.sa_handler = sig_stop_listen;
+  sa_new.sa_handler = sig_terminate;
   sigaction(SIGINT, &sa_new, &sa_old);
 
   /* Setup the masks for pselect() */
@@ -343,15 +362,19 @@ int main(int argc, char * const argv[]) {
 
   /* Create the flow trees */
   for (i = 0; i < TREES; i++) {
-    flow_tree[i] = pavl_create(compare_flows, NULL, NULL);
+    flow_hash_trees[i].tree = pavl_create(compare_flows, NULL, NULL);
+    pthread_mutex_init(&(flow_hash_trees[i].tree_mutex), NULL);
   }
 
   /* Record what time we started */
   start_time = time(NULL);
   last_stats_update = start_time;
+
+  /* Before listening, start the janitor thread */
+  thread_ret = pthread_create(&flow_janitor, NULL, thread_flow_janitor, NULL);
   
   /* Testing receive, will do better in final code */
-  while (listen_stop == 0) {
+  while (terminate == 0) {
 
     /* Check if we need to update the stats */
     cur_time = time(NULL);
@@ -381,6 +404,15 @@ int main(int argc, char * const argv[]) {
 	fprintf(stderr, "excluded flows: %lu (%.02f%%)\n",
 		stat_excluded_flows, ((double)stat_excluded_flows /
 				      (double)stat_total_flows) * 100);
+
+	/* === *** ACQUIRE STATS LOCK *** === */
+	pthread_mutex_lock(&stat_current_mutex);
+
+	fprintf(stderr, "currently tracking flows: %lu\n", stat_current_flows);
+
+	/* === *** UNLOCK STATS LOCK *** === */
+	pthread_mutex_unlock(&stat_current_mutex);
+
 	fprintf(stderr, "total unique flows: %lu (%.02f%%)\n",
 		stat_new_flows, ((double)stat_new_flows /
 				 (double)(stat_total_flows)) * 100);
@@ -470,6 +502,10 @@ int main(int argc, char * const argv[]) {
     }
     
   }
+
+  /* === Stopped listening, must have gotten signal === */
+  fprintf(stderr, "Waiting for threads to finish before exiting...\n");
+  pthread_join(flow_janitor, NULL);
 
   close(sock_fh);
 
@@ -752,14 +788,21 @@ void flow_callback(const struct unified_flow *current_flow) {
   /* Figure out which tree to use */
   tree_num = TREEHASH(flow_summary_copy);
    
+  /* === *** ACQUIRE TREE LOCK *** === */
+  pthread_mutex_lock(&(flow_hash_trees[tree_num].tree_mutex));
+
   /* Search and possibly insert this flow */
   flow_summary_probe =
-    (struct flow_summary **)pavl_probe(flow_tree[tree_num],
+    (struct flow_summary **)pavl_probe(flow_hash_trees[tree_num].tree,
 				       flow_summary_copy);
   
   /* Figure out what happened */
   if (flow_summary_probe == NULL) {
     fprintf(stderr, "There was a failure inserting the flow into tree.\n");
+
+    /* === *** RELEASE LOCK *** === */
+    pthread_mutex_unlock(&(flow_hash_trees[tree_num].tree_mutex));
+
     return;
   }
 
@@ -770,12 +813,20 @@ void flow_callback(const struct unified_flow *current_flow) {
 
     /* should increment new flow counters */
     stat_new_flows++;
+
+    /* === *** ACQUIRE STATS LOCK *** === */
+    pthread_mutex_lock(&stat_current_mutex);
+
     stat_current_flows++;
+
+    /* === *** UNLOCK STATS LOCK *** === */
+    pthread_mutex_unlock(&stat_current_mutex);
+
     stat_proto_flows[(*flow_summary_probe)->protocol] += 1;
   }
   else {
     /* fprintf(stderr, "Flow already in tree; flows=%u\n",
-       (unsigned int)pavl_count(flow_tree[tree_num]));
+       (unsigned int)pavl_count(flow_hash_trees[tree_num].tree));
     */
 
     /* update the stats */
@@ -858,14 +909,17 @@ void flow_callback(const struct unified_flow *current_flow) {
     
     /* Update the source count for the flow */
     (*flow_summary_probe)->source_count += 1;
-  }	
+  }
+
+  /* === *** RELEASE TREE LOCK *** === */
+  pthread_mutex_unlock(&(flow_hash_trees[tree_num].tree_mutex));
   
 }
 
 
-void sig_stop_listen(int signo) {
+void sig_terminate(int signo) {
   /* It is dangerous to do much more than this in a signal handler */
-  listen_stop = 1;
+  terminate = 1;
 }
 
 
@@ -1014,4 +1068,105 @@ int is_excluded(const in_addr_t check_addr) {
     return 1;
   }
 
+}
+
+
+void *thread_flow_janitor(void * arg) {
+
+  /* Misc vars */
+  struct timeval sleep_time;
+  time_t cur_time;
+  int tree_num;
+  struct pavl_traverser traverser;
+  struct flow_summary *flow_last, *flow_cur;
+  int deleted;
+
+  while (terminate == 0) {
+
+    /* sleep 15 sec between purges */
+    sleep_time.tv_sec = 15;
+    sleep_time.tv_usec = 0;
+    select(0, NULL, NULL, NULL, &sleep_time);
+
+    /* fprintf(stderr, "thread still here\n"); */
+
+    deleted = 0;
+    cur_time = time(NULL);
+    for (tree_num = 0; tree_num < TREES; tree_num++) {
+
+      /* === *** ACQUIRE TREE LOCK *** === */
+      pthread_mutex_lock(&(flow_hash_trees[tree_num].tree_mutex));      
+
+      pavl_t_init(&traverser, flow_hash_trees[tree_num].tree);
+
+      flow_last = (struct flow_summary *)pavl_t_next(&traverser);
+      flow_cur = (struct flow_summary *)pavl_t_next(&traverser);
+
+      while (flow_last != NULL) {
+      
+	if ((cur_time - flow_last->time_updated > MIN_FLOW_AGE) ||
+	    (cur_time - flow_last->time_added > MAX_FLOW_AGE)) {
+
+	  /* Do the deletion */
+	  flow_last =
+	    (struct flow_summary *)pavl_delete(flow_hash_trees[tree_num].tree,
+					       flow_last);
+
+	  /* ===
+	   * *** THIS FLOW NEEDS TO BE OUTPUTTED SOMEWHERE
+	   * OR IT WILL BE LOST FOREVER! ***
+	   * (outputting comes later)
+	   * ===
+	   */
+
+	  /* Free the flow sources list */
+	  free_source_list(flow_last->sources);
+	  
+	  /* Now free the flow */
+	  free(flow_last);
+
+	  deleted++;
+	}	  
+
+	/* Move on */
+	flow_last = flow_cur;
+	flow_cur = (struct flow_summary *)pavl_t_next(&traverser);
+      }
+
+      /* === *** RELEASE TREE LOCK *** === */
+      pthread_mutex_unlock(&(flow_hash_trees[tree_num].tree_mutex));
+
+    } /* END for tree_num */
+
+    /* === *** ACQUIRE STATS LOCK *** === */
+    pthread_mutex_lock(&stat_current_mutex);
+    
+    /* Update current stats */
+    stat_current_flows -= deleted;
+
+    /* === *** UNLOCK STATS LOCK *** === */
+    pthread_mutex_unlock(&stat_current_mutex);
+    
+
+  } /* END while terminate */
+
+
+  return NULL;
+}
+
+
+void free_source_list(struct flow_source_summary *f_source) {
+
+  struct flow_source_summary *cur_f_source;
+
+  /* Free the list and the data */
+  while (f_source != NULL) {
+    cur_f_source = f_source; /* work on the current flow source node */
+    f_source = f_source->next; /* grab the next one */
+
+    /* Get rid of the struct */
+    free(cur_f_source);
+  }
+
+  return;
 }
