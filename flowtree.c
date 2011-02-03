@@ -374,24 +374,24 @@ int main(int argc, char * const argv[]) {
 	fprintf(stderr, "packet rate: %.02f pps; "
 		"flow rate: %.02f fps; new flow rate %.02f fps\n",
 		(double)stat_flow_packets / (double)time_diff,
-		(double)(stat_new_flows + stat_dup_flows) / (double)time_diff,
+		(double)(stat_total_flows) / (double)time_diff,
 		(double)stat_new_flows / (double)time_diff);
 	fprintf(stderr, "excluded flows: %lu (%.02f%%)\n",
 		stat_excluded_flows, ((double)stat_excluded_flows /
 				      (double)stat_total_flows) * 100);
-	fprintf(stderr, "unique flows: %lu (%.02f%%)\n",
+	fprintf(stderr, "total unique flows: %lu (%.02f%%)\n",
 		stat_new_flows, ((double)stat_new_flows /
 				 (double)(stat_total_flows)) * 100);
-	fprintf(stderr, "tcp flows: %lu (%.02f%%)\n",
+	fprintf(stderr, "unique tcp flows: %lu (%.02f%%)\n",
 		stat_tcp_flows, ((double)stat_tcp_flows /
 				 (double)stat_new_flows) * 100);
-	fprintf(stderr, "udp flows: %lu (%.02f%%)\n",
+	fprintf(stderr, "unique udp flows: %lu (%.02f%%)\n",
 		stat_udp_flows, ((double)stat_udp_flows /
 				 (double)stat_new_flows) * 100);
-	fprintf(stderr, "icmp flows: %lu (%.02f%%)\n",
+	fprintf(stderr, "unique icmp flows: %lu (%.02f%%)\n",
 		stat_icmp_flows, ((double)stat_icmp_flows /
 				  (double)stat_new_flows) * 100);
-	fprintf(stderr, "other flows: %lu (%.02f%%)\n",
+	fprintf(stderr, "unique other flows: %lu (%.02f%%)\n",
 		stat_other_flows, ((double)stat_other_flows /
 				   (double)stat_new_flows) * 100);
       }
