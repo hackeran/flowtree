@@ -23,6 +23,9 @@
 #include <arpa/inet.h>
 #include <sys/select.h>
 
+/* The threading stuff */
+#include <pthread.h>
+
 /* The AVL tree */
 #include "pavl.h"
 
@@ -233,10 +236,9 @@ struct pavl_table *flow_tree[TREES];
  * Some stats vars
  * ===
  */
-uint64_t stat_flow_packets = 0, stat_total_flows = 0;
+uint64_t stat_flow_packets = 0, stat_total_flows = 0, stat_excluded_flows = 0;
 uint64_t stat_new_flows = 0, stat_dup_flows = 0, stat_current_flows = 0;
-uint64_t stat_icmp_flows = 0, stat_tcp_flows = 0, stat_udp_flows = 0;
-uint64_t stat_other_flows = 0, stat_excluded_flows = 0;
+uint64_t stat_proto_flows[256];
 
 
 /* ===
@@ -383,17 +385,41 @@ int main(int argc, char * const argv[]) {
 		stat_new_flows, ((double)stat_new_flows /
 				 (double)(stat_total_flows)) * 100);
 	fprintf(stderr, "unique tcp flows: %lu (%.02f%%)\n",
-		stat_tcp_flows, ((double)stat_tcp_flows /
-				 (double)stat_new_flows) * 100);
+		stat_proto_flows[6], ((double)stat_proto_flows[6] /
+				      (double)stat_new_flows) * 100);
 	fprintf(stderr, "unique udp flows: %lu (%.02f%%)\n",
-		stat_udp_flows, ((double)stat_udp_flows /
-				 (double)stat_new_flows) * 100);
+		stat_proto_flows[17], ((double)stat_proto_flows[17] /
+				       (double)stat_new_flows) * 100);
 	fprintf(stderr, "unique icmp flows: %lu (%.02f%%)\n",
-		stat_icmp_flows, ((double)stat_icmp_flows /
-				  (double)stat_new_flows) * 100);
-	fprintf(stderr, "unique other flows: %lu (%.02f%%)\n",
-		stat_other_flows, ((double)stat_other_flows /
-				   (double)stat_new_flows) * 100);
+		stat_proto_flows[1], ((double)stat_proto_flows[1] /
+				      (double)stat_new_flows) * 100);
+	fprintf(stderr, "unique eth-in-ip flows: %lu (%.02f%%)\n",
+		stat_proto_flows[97], ((double)stat_proto_flows[97] /
+				       (double)stat_new_flows) * 100);
+	fprintf(stderr, "unique 6in4 flows: %lu (%.02f%%)\n",
+		stat_proto_flows[41], ((double)stat_proto_flows[41] /
+				       (double)stat_new_flows) * 100);
+	fprintf(stderr, "unique pim flows: %lu (%.02f%%)\n",
+		stat_proto_flows[103], ((double)stat_proto_flows[103] /
+					(double)stat_new_flows) * 100);
+	fprintf(stderr, "unique igmp flows: %lu (%.02f%%)\n",
+		stat_proto_flows[2], ((double)stat_proto_flows[2] /
+				      (double)stat_new_flows) * 100);
+	fprintf(stderr, "unique ip in ip flows: %lu (%.02f%%)\n",
+		stat_proto_flows[4], ((double)stat_proto_flows[4] /
+				      (double)stat_new_flows) * 100);
+	fprintf(stderr, "unique eigrp flows: %lu (%.02f%%)\n",
+		stat_proto_flows[88], ((double)stat_proto_flows[88] /
+				       (double)stat_new_flows) * 100);
+	fprintf(stderr, "unique esp flows: %lu (%.02f%%)\n",
+		stat_proto_flows[50], ((double)stat_proto_flows[50] /
+				       (double)stat_new_flows) * 100);
+	fprintf(stderr, "unique ah flows: %lu (%.02f%%)\n",
+		stat_proto_flows[51], ((double)stat_proto_flows[51] /
+				       (double)stat_new_flows) * 100);
+	fprintf(stderr, "unique gre flows: %lu (%.02f%%)\n",
+		stat_proto_flows[47], ((double)stat_proto_flows[47] /
+				       (double)stat_new_flows) * 100);
       }
     }
 
@@ -404,7 +430,7 @@ int main(int argc, char * const argv[]) {
     sel_timespec.tv_sec = 0;
     sel_timespec.tv_nsec = 100000000; /* .1 seconds */
 
-    /* Block signals */
+    /* Block signals */ /* NOT THREAD SAFE */
     sigprocmask(SIG_BLOCK, &emptysigmask, NULL);
 
     /* See if we have data */
@@ -661,7 +687,6 @@ void flow_callback(const struct unified_flow *current_flow) {
   struct in_addr temp_inaddr_src, temp_inaddr_dst;
   int source_updated;
 
-
   /* ===
    * Update the stats that we got a flow
    * ===
@@ -746,18 +771,7 @@ void flow_callback(const struct unified_flow *current_flow) {
     /* should increment new flow counters */
     stat_new_flows++;
     stat_current_flows++;
-    if ((*flow_summary_probe)->protocol == 17) {
-      stat_udp_flows++;
-    }
-    else if ((*flow_summary_probe)->protocol == 6) {
-      stat_tcp_flows++;
-    }
-    else if ((*flow_summary_probe)->protocol == 1) {
-      stat_icmp_flows++;
-    }
-    else {
-      stat_other_flows++;
-    }
+    stat_proto_flows[(*flow_summary_probe)->protocol] += 1;
   }
   else {
     /* fprintf(stderr, "Flow already in tree; flows=%u\n",
