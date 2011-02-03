@@ -689,7 +689,7 @@ void flow_callback(const struct unified_flow *current_flow) {
    * === 
    */
   if ((is_excluded(current_flow->src_addr.s_addr) == 1) ||
-      (is_excluded(current_flow->src_addr.s_addr) == 1)) {
+      (is_excluded(current_flow->dst_addr.s_addr) == 1)) {
 
     /*
     fprintf(stderr, "excluded %s -> ", inet_ntoa(temp_inaddr_src));
