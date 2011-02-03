@@ -169,6 +169,19 @@ struct flow_summary {
 
 
 /* ===
+ * The exclude list structs and vars
+ * ===
+ */
+struct exclude_node {
+  in_addr_t addr_start;
+  in_addr_t addr_end;
+  uint64_t exclude_count;
+};
+
+struct pavl_table *exclude_tree;  
+
+
+/* ===
  * Function prototypes
  * ===
  */
@@ -182,7 +195,10 @@ void parse_netflow_v7(const struct sockaddr_in *, const u_char *,
 		      const size_t, const time_t);
 void flow_callback(const struct unified_flow *);
 int compare_flows(const void *, const void *, void *);
+int compare_excludes(const void *, const void *, void *);
 void * copy_flow(const void *, void *);
+void add_exclusion(const in_addr_t, const in_addr_t);
+int is_excluded(const in_addr_t);
 
 
 /* ===
@@ -217,10 +233,10 @@ struct pavl_table *flow_tree[TREES];
  * Some stats vars
  * ===
  */
-uint64_t stat_flow_packets = 0;
+uint64_t stat_flow_packets = 0, stat_total_flows = 0;
 uint64_t stat_new_flows = 0, stat_dup_flows = 0, stat_current_flows = 0;
 uint64_t stat_icmp_flows = 0, stat_tcp_flows = 0, stat_udp_flows = 0;
-uint64_t stat_other_flows = 0;
+uint64_t stat_other_flows = 0, stat_excluded_flows = 0;
 
 
 /* ===
@@ -313,6 +329,15 @@ int main(int argc, char * const argv[]) {
     return 1;
   }  
 
+  
+  /* Create the exclude tree */
+  exclude_tree = pavl_create(compare_excludes, NULL, NULL);
+
+  /* Populate the exclusion tree */
+  add_exclusion(inet_network("132.239.1.114"), inet_network("132.239.1.116"));
+  add_exclusion(inet_network("132.239.1.199"), inet_network("132.239.1.204"));
+  add_exclusion(inet_network("44.0.0.0"), inet_network("44.255.255.255"));
+
 
   /* Create the flow trees */
   for (i = 0; i < TREES; i++) {
@@ -345,16 +370,18 @@ int main(int argc, char * const argv[]) {
 	fprintf(stderr, "===============\n");
 	fprintf(stderr, "runtime: %d seconds; total packets: %lu; "
 		"total flows: %lu\n", (int)time_diff,
-		stat_flow_packets, stat_new_flows + stat_dup_flows);
+		stat_flow_packets, stat_total_flows);
 	fprintf(stderr, "packet rate: %.02f pps; "
 		"flow rate: %.02f fps; new flow rate %.02f fps\n",
 		(double)stat_flow_packets / (double)time_diff,
 		(double)(stat_new_flows + stat_dup_flows) / (double)time_diff,
 		(double)stat_new_flows / (double)time_diff);
+	fprintf(stderr, "excluded flows: %lu (%.02f%%)\n",
+		stat_excluded_flows, ((double)stat_excluded_flows /
+				      (double)stat_total_flows) * 100);
 	fprintf(stderr, "unique flows: %lu (%.02f%%)\n",
 		stat_new_flows, ((double)stat_new_flows /
-				 (double)(stat_new_flows +
-					  stat_dup_flows)) * 100);
+				 (double)(stat_total_flows)) * 100);
 	fprintf(stderr, "tcp flows: %lu (%.02f%%)\n",
 		stat_tcp_flows, ((double)stat_tcp_flows /
 				 (double)stat_new_flows) * 100);
@@ -634,6 +661,14 @@ void flow_callback(const struct unified_flow *current_flow) {
   struct in_addr temp_inaddr_src, temp_inaddr_dst;
   int source_updated;
 
+
+  /* ===
+   * Update the stats that we got a flow
+   * ===
+   */
+  stat_total_flows += 1;
+
+
   temp_inaddr_src.s_addr = htonl(current_flow->src_addr.s_addr);
   temp_inaddr_dst.s_addr = htonl(current_flow->dst_addr.s_addr);
   /*
@@ -647,6 +682,24 @@ void flow_callback(const struct unified_flow *current_flow) {
     (unsigned int)current_flow->start_time,
     (unsigned int)current_flow->end_time);
   */
+
+
+  /* ===
+   * Check to see if this flow is excluded
+   * === 
+   */
+  if ((is_excluded(current_flow->src_addr.s_addr) == 1) ||
+      (is_excluded(current_flow->src_addr.s_addr) == 1)) {
+
+    /*
+    fprintf(stderr, "excluded %s -> ", inet_ntoa(temp_inaddr_src));
+    fprintf(stderr, "%s\n", inet_ntoa(temp_inaddr_dst));
+    */
+
+    stat_excluded_flows += 1;
+
+    return;
+  }
 
 
   /* ===
@@ -855,4 +908,96 @@ void * copy_flow(const void *a, void *param) {
   }
   
   return f;
+}
+
+
+int compare_excludes(const void *a, const void *b, void *param) {
+
+  const struct exclude_node *ea = a;
+  const struct exclude_node *eb = b;
+
+  if (ea->addr_start > eb->addr_end) {
+    return 1;
+  }
+  else if (ea->addr_end < eb->addr_start) {
+    return -1;
+  }
+  else {
+    return 0;
+  }
+
+}
+
+
+void add_exclusion(const in_addr_t addr_start, const in_addr_t addr_end) {
+
+  struct exclude_node *ex;
+  struct exclude_node *ex_del;
+  struct exclude_node **ex_probe;
+
+  ex = malloc(sizeof(struct exclude_node));
+
+  ex->addr_start = addr_start;
+  ex->addr_end = addr_end;
+  ex->exclude_count = 0;
+
+  /* Search for and possibly insert this exclude */
+  ex_probe = (struct exclude_node **)pavl_probe(exclude_tree, ex);
+  
+  /* Figure out what happened */
+  if (ex_probe == NULL) {
+    fprintf(stderr, "There was a failure inserting the exclude into tree.\n");
+    return;
+  }
+
+  /* Now find out if it was already there or we just inserted it */
+  if (*ex_probe == ex) {
+    /* Great, it was inserted, nothing to do now */
+    return;
+  }
+  else {
+
+    /* First combine */
+    if ((*ex_probe)->addr_start < ex->addr_start) {
+      ex->addr_start = (*ex_probe)->addr_start;
+    }
+    if ((*ex_probe)->addr_end > ex->addr_end) {
+      ex->addr_end = (*ex_probe)->addr_end;
+    }
+
+    /* Now remove the old exclude */
+    ex_del = (struct exclude_node *)pavl_delete(exclude_tree, *ex_probe);
+
+    /* Now insert this new combined exclude */
+    add_exclusion(ex->addr_start, ex->addr_end);
+    
+    /* cleanup */
+    free(ex);
+    free(ex_del);
+
+    return;
+
+  }
+}
+
+
+int is_excluded(const in_addr_t check_addr) {
+
+  struct exclude_node check_ex;
+  struct exclude_node *ex_search;
+
+  check_ex.addr_start = check_addr;
+  check_ex.addr_end = check_addr;
+  check_ex.exclude_count = 0;
+
+  ex_search = (struct exclude_node *)pavl_find(exclude_tree, &check_ex);
+
+  if (ex_search == NULL) {
+    return 0;
+  }
+  else {
+    ex_search->exclude_count += 1;
+    return 1;
+  }
+
 }
