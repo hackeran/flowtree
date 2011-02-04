@@ -204,6 +204,7 @@ void add_exclusion(const in_addr_t, const in_addr_t);
 int is_excluded(const in_addr_t);
 void *thread_flow_janitor(void *);
 void free_source_list(struct flow_source_summary *);
+void print_flow_json(const struct flow_summary *);
 
 
 /* ===
@@ -490,9 +491,15 @@ int main(int argc, char * const argv[]) {
       return 1;
     }
     else {
-      /*fprintf(stderr, "Got a packet from %s:%d; size=%d\n",
+      /*
+      fprintf(stderr, "Got a packet from %s:%d; size=%d\n",
 	      inet_ntoa(peer_addrin.sin_addr), ntohs(peer_addrin.sin_port),
-	      (int)msgsize);*/
+	      (int)msgsize);
+      */
+
+      /* We need to fix the byte order for the peer */
+      peer_addrin.sin_addr.s_addr = ntohl(peer_addrin.sin_addr.s_addr);
+
 
       /* Update the counter */
       stat_flow_packets += 1;
@@ -779,7 +786,7 @@ void flow_callback(const struct unified_flow *current_flow) {
   cur_flow_summary.tcp_flags = current_flow->tcp_flags;
   cur_flow_summary.start_time = current_flow->start_time;
   cur_flow_summary.end_time = current_flow->end_time;
-  cur_flow_summary.source_count = 1;
+  cur_flow_summary.source_count = 0; /* gets updated later */
   cur_flow_summary.sources = NULL;
 
   /* Now make an insert-ready copy */
@@ -1118,6 +1125,7 @@ void *thread_flow_janitor(void * arg) {
 	   * (outputting comes later)
 	   * ===
 	   */
+	  print_flow_json(flow_last);
 
 	  /* Free the flow sources list */
 	  free_source_list(flow_last->sources);
@@ -1169,4 +1177,56 @@ void free_source_list(struct flow_source_summary *f_source) {
   }
 
   return;
+}
+
+
+void print_flow_json(const struct flow_summary *flow) {
+
+  /* === Misc vars === */
+  struct flow_source_summary *flow_source;
+  struct in_addr temp_inaddr_src, temp_inaddr_dst, temp_inaddr_flow;
+
+  temp_inaddr_src.s_addr = htonl(flow->src_addr.s_addr);
+  temp_inaddr_dst.s_addr = htonl(flow->dst_addr.s_addr);
+
+
+  fprintf(stdout, "{\n");
+  fprintf(stdout, "\t\"src_addr\": \"%s\",\n", inet_ntoa(temp_inaddr_src));
+  fprintf(stdout, "\t\"dst_addr\": \"%s\",\n", inet_ntoa(temp_inaddr_dst));
+  fprintf(stdout, "\t\"protocol\": %d,\n", flow->protocol);
+  fprintf(stdout, "\t\"src_port\": %d,\n", flow->src_port);
+  fprintf(stdout, "\t\"dst_port\": %d,\n", flow->dst_port);
+  fprintf(stdout, "\t\"tcp_flags\": %d,\n", flow->tcp_flags);
+  fprintf(stdout, "\t\"start_time\": %d,\n", (int)(flow->start_time));
+  fprintf(stdout, "\t\"end_time\": %d,\n", (int)(flow->end_time));
+  fprintf(stdout, "\t\"source_count\": %d,\n", flow->source_count);
+  fprintf(stdout, "\t\"source_stats\": [\n");
+
+  flow_source = flow->sources;
+  while (flow_source != NULL) {
+
+    temp_inaddr_flow.s_addr = htonl(flow_source->flow_src);
+
+    fprintf(stdout, "\t\t{\n");
+    fprintf(stdout, "\t\t\"flow_source\": \"%s\"\n",
+	    inet_ntoa(temp_inaddr_flow));
+    fprintf(stdout, "\t\t\"src_int\": %d,\n", flow_source->src_int);
+    fprintf(stdout, "\t\t\"dst_int\": %d,\n", flow_source->dst_int);
+    fprintf(stdout, "\t\t\"num_packets\": %lu,\n", flow_source->num_packets);
+    fprintf(stdout, "\t\t\"num_bytes\": %lu,\n", flow_source->num_bytes);
+    fprintf(stdout, "\t\t\"num_flows\": %lu\n", flow_source->num_flows);
+
+    flow_source = flow_source->next;
+
+    if (flow_source == NULL) {
+      fprintf(stdout, "\t\t}\n");
+    }
+    else {
+      fprintf(stdout, "\t\t},\n");
+    }
+  }
+  fprintf(stdout, "\t]\n");
+  fprintf(stdout, "}\n");
+  
+
 }
