@@ -33,10 +33,16 @@
 int terminate = 0;
 
 /* Network stuff */
-#define BINDADDR "132.239.1.114"
-#define BINDPORT 2055
+#define LISTENADDR "132.239.1.114"
+#define LISTENPORT 2055
 #define SOCKBUFF 1024 * 1024 /* 1 MB */
-#define BUFFSIZE 65536
+#define RECVBUFFSIZE 65536
+
+#define SENDSRC "127.0.0.1"
+#define SENDDST "127.0.0.1"
+#define SENDPORT 2056
+#define SENDBUFFSIZE 65536
+int send_fh;
 
 
 /* ===
@@ -273,15 +279,16 @@ int main(int argc, char * const argv[]) {
   sigset_t sigmask, emptysigmask;
 
   /* === Socket vars === */
-  struct sockaddr_in bind_addrin, peer_addrin;
+  struct sockaddr_in bind_addrin, peer_addrin, send_addrin;
   in_addr_t bind_addr;
+  in_addr_t send_addr;
   int sock_fh;
   int setsockbuff = SOCKBUFF, getsockbuff;
   socklen_t sockbufflen = sizeof(getsockbuff);
   socklen_t peeraddrlen = sizeof(peer_addrin);
 
   /* === Network data vars === */
-  u_char buffer[BUFFSIZE];
+  u_char buffer[RECVBUFFSIZE];
   ssize_t msgsize;
   fd_set read_fd;
   struct timespec sel_timespec;
@@ -313,40 +320,81 @@ int main(int argc, char * const argv[]) {
   sigaddset(&sigmask, SIGINT);
 
 
-  /* Make our socket */
+  /* Make our listen socket */
   if ((sock_fh = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) == -1) {
-    fprintf(stderr, "Creation of socket failed.\n");
+    fprintf(stderr, "Creation of listen socket failed.\n");
     return 1;
   }
 
   /* Try to set the socket buffer */
   if (setsockopt(sock_fh, SOL_SOCKET, SO_RCVBUF,
 		 &setsockbuff, sizeof(setsockbuff)) == -1) {
-    fprintf(stderr, "Setting socket receive buffer failed.\n");
+    fprintf(stderr, "Setting listen socket receive buffer failed.\n");
     return 1;
   }
 
   /* Now find out what our socket buffer really is set to */
   if (getsockopt(sock_fh, SOL_SOCKET, SO_RCVBUF,
 		 &getsockbuff, &sockbufflen) == -1) {
-    fprintf(stderr, "Unable to get socket receive buffer.\n");
+    fprintf(stderr, "Unable to get listen socket receive buffer.\n");
     return 1;
   }
   else {
-    fprintf(stderr, "Socket receive buffer is %d bytes\n", getsockbuff);
+    fprintf(stderr, "Listen socket receive buffer is %d bytes\n", getsockbuff);
   }
 
+
+  /* Make our send socket */
+  if ((send_fh = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) == -1) {
+    fprintf(stderr, "Creation of send socket failed.\n");
+    return 1;
+  }
+
+  /* Try to set the send socket buffer */
+  if (setsockopt(send_fh, SOL_SOCKET, SO_SNDBUF,
+		 &setsockbuff, sizeof(setsockbuff)) == -1) {
+    fprintf(stderr, "Setting send socket send buffer failed.\n");
+    return 1;
+  }
+
+  /* Now find out what our socket buffer really is set to */
+  if (getsockopt(send_fh, SOL_SOCKET, SO_SNDBUF,
+		 &getsockbuff, &sockbufflen) == -1) {
+    fprintf(stderr, "Unable to get send socket send buffer.\n");
+    return 1;
+  }
+  else {
+    fprintf(stderr, "Send socket send buffer is %d bytes\n", getsockbuff);
+  }
+
+
   /* Setup the binding struct */
-  bind_addr = inet_addr(BINDADDR);
+  bind_addr = inet_addr(LISTENADDR);
   memset(&bind_addrin, 0, sizeof(bind_addrin));
   bind_addrin.sin_family = AF_INET;
-  bind_addrin.sin_port = htons(BINDPORT);
+  bind_addrin.sin_port = htons(LISTENPORT);
   bind_addrin.sin_addr.s_addr = bind_addr;
 
   /* Do the bind */
   if (bind(sock_fh, (const struct sockaddr *)&bind_addrin,
 	   sizeof(bind_addrin)) == -1) {
     fprintf(stderr, "Binding to socket failed.\n");
+    perror("bind");
+    return 1;
+  }  
+
+
+  /* Setup the send binding struct */
+  send_addr = inet_addr(SENDSRC);
+  memset(&send_addrin, 0, sizeof(send_addrin));
+  send_addrin.sin_family = AF_INET;
+  send_addrin.sin_port = 0;
+  send_addrin.sin_addr.s_addr = send_addr;
+
+  /* Do the send bind */
+  if (bind(send_fh, (const struct sockaddr *)&send_addrin,
+	   sizeof(send_addrin)) == -1) {
+    fprintf(stderr, "Binding to sending socket failed.\n");
     perror("bind");
     return 1;
   }  
@@ -483,7 +531,7 @@ int main(int argc, char * const argv[]) {
 
 
     /* Select says we have a message, grab it */
-    if ((msgsize = recvfrom(sock_fh, buffer, BUFFSIZE, 0,
+    if ((msgsize = recvfrom(sock_fh, buffer, RECVBUFFSIZE, 0,
 			    (struct sockaddr *)&peer_addrin,
 			    &peeraddrlen)) == -1) {
       fprintf(stderr, "recvfrom() call failed!\n");
@@ -1090,8 +1138,8 @@ void *thread_flow_janitor(void * arg) {
 
   while (terminate == 0) {
 
-    /* sleep 15 sec between purges */
-    sleep_time.tv_sec = 15;
+    /* sleep 5 sec between purges */
+    sleep_time.tv_sec = 5;
     sleep_time.tv_usec = 0;
     select(0, NULL, NULL, NULL, &sleep_time);
 
@@ -1185,48 +1233,114 @@ void print_flow_json(const struct flow_summary *flow) {
   /* === Misc vars === */
   struct flow_source_summary *flow_source;
   struct in_addr temp_inaddr_src, temp_inaddr_dst, temp_inaddr_flow;
+  char outbuff[SENDBUFFSIZE + 1];
+  int outindex;
+  struct sockaddr_in send_addrin;
 
   temp_inaddr_src.s_addr = htonl(flow->src_addr.s_addr);
   temp_inaddr_dst.s_addr = htonl(flow->dst_addr.s_addr);
 
 
-  fprintf(stdout, "{\n");
-  fprintf(stdout, "\t\"src_addr\": \"%s\",\n", inet_ntoa(temp_inaddr_src));
-  fprintf(stdout, "\t\"dst_addr\": \"%s\",\n", inet_ntoa(temp_inaddr_dst));
-  fprintf(stdout, "\t\"protocol\": %d,\n", flow->protocol);
-  fprintf(stdout, "\t\"src_port\": %d,\n", flow->src_port);
-  fprintf(stdout, "\t\"dst_port\": %d,\n", flow->dst_port);
-  fprintf(stdout, "\t\"tcp_flags\": %d,\n", flow->tcp_flags);
-  fprintf(stdout, "\t\"start_time\": %d,\n", (int)(flow->start_time));
-  fprintf(stdout, "\t\"end_time\": %d,\n", (int)(flow->end_time));
-  fprintf(stdout, "\t\"source_count\": %d,\n", flow->source_count);
-  fprintf(stdout, "\t\"source_stats\": [\n");
+  /* This is some ugly-ass code.  I can't think of a way to do it securely
+   * and cleanly though ...
+   */
+
+  outindex = 0;
+
+  outindex +=
+    snprintf(outbuff + outindex, SENDBUFFSIZE - outindex - 1,
+	     "{\n");
+  outindex +=
+    snprintf(outbuff + outindex, SENDBUFFSIZE - outindex - 1,
+	     "\t\"src_addr\": \"%s\",\n", inet_ntoa(temp_inaddr_src));
+  outindex +=
+    snprintf(outbuff + outindex, SENDBUFFSIZE - outindex - 1,
+	     "\t\"dst_addr\": \"%s\",\n", inet_ntoa(temp_inaddr_dst));
+  outindex +=
+    snprintf(outbuff + outindex, SENDBUFFSIZE - outindex - 1,
+	     "\t\"protocol\": %d,\n", flow->protocol);
+  outindex +=
+    snprintf(outbuff + outindex, SENDBUFFSIZE - outindex - 1,
+	     "\t\"src_port\": %d,\n", flow->src_port);
+  outindex +=
+    snprintf(outbuff + outindex, SENDBUFFSIZE - outindex - 1,
+	     "\t\"dst_port\": %d,\n", flow->dst_port);
+  outindex +=
+    snprintf(outbuff + outindex, SENDBUFFSIZE - outindex - 1,
+	     "\t\"tcp_flags\": %d,\n", flow->tcp_flags);
+  outindex +=
+    snprintf(outbuff + outindex, SENDBUFFSIZE - outindex - 1,
+	     "\t\"start_time\": %d,\n", (int)(flow->start_time));
+  outindex +=
+    snprintf(outbuff + outindex, SENDBUFFSIZE - outindex - 1,
+	     "\t\"end_time\": %d,\n", (int)(flow->end_time));
+  outindex +=
+    snprintf(outbuff + outindex, SENDBUFFSIZE - outindex - 1,
+	     "\t\"source_count\": %d,\n", flow->source_count);
+  outindex +=
+    snprintf(outbuff + outindex, SENDBUFFSIZE - outindex - 1,
+	     "\t\"source_stats\": [\n");
 
   flow_source = flow->sources;
   while (flow_source != NULL) {
 
     temp_inaddr_flow.s_addr = htonl(flow_source->flow_src);
 
-    fprintf(stdout, "\t\t{\n");
-    fprintf(stdout, "\t\t\"flow_source\": \"%s\"\n",
-	    inet_ntoa(temp_inaddr_flow));
-    fprintf(stdout, "\t\t\"src_int\": %d,\n", flow_source->src_int);
-    fprintf(stdout, "\t\t\"dst_int\": %d,\n", flow_source->dst_int);
-    fprintf(stdout, "\t\t\"num_packets\": %lu,\n", flow_source->num_packets);
-    fprintf(stdout, "\t\t\"num_bytes\": %lu,\n", flow_source->num_bytes);
-    fprintf(stdout, "\t\t\"num_flows\": %lu\n", flow_source->num_flows);
+    outindex +=
+      snprintf(outbuff + outindex, SENDBUFFSIZE - outindex - 1,
+	       "\t\t{\n");
+    outindex +=
+      snprintf(outbuff + outindex, SENDBUFFSIZE - outindex - 1,
+	       "\t\t\"flow_source\": \"%s\"\n", inet_ntoa(temp_inaddr_flow));
+    outindex +=
+      snprintf(outbuff + outindex, SENDBUFFSIZE - outindex - 1,
+	       "\t\t\"src_int\": %d,\n", flow_source->src_int);
+    outindex +=
+      snprintf(outbuff + outindex, SENDBUFFSIZE - outindex - 1,
+	       "\t\t\"dst_int\": %d,\n", flow_source->dst_int);
+    outindex +=
+      snprintf(outbuff + outindex, SENDBUFFSIZE - outindex - 1,
+	       "\t\t\"num_packets\": %lu,\n", flow_source->num_packets);
+    outindex +=
+      snprintf(outbuff + outindex, SENDBUFFSIZE - outindex - 1,
+	       "\t\t\"num_bytes\": %lu,\n", flow_source->num_bytes);
+    outindex +=
+      snprintf(outbuff + outindex, SENDBUFFSIZE - outindex - 1,
+	       "\t\t\"num_flows\": %lu\n", flow_source->num_flows);
 
     flow_source = flow_source->next;
 
     if (flow_source == NULL) {
-      fprintf(stdout, "\t\t}\n");
+      outindex +=
+	snprintf(outbuff + outindex, SENDBUFFSIZE - outindex - 1,
+		 "\t\t}\n");
     }
     else {
-      fprintf(stdout, "\t\t},\n");
+      outindex +=
+	snprintf(outbuff + outindex, SENDBUFFSIZE - outindex - 1,
+		 "\t\t},\n");
     }
   }
-  fprintf(stdout, "\t]\n");
-  fprintf(stdout, "}\n");
+  outindex +=
+    snprintf(outbuff + outindex, SENDBUFFSIZE - outindex - 1,
+	     "\t]\n");
+  outindex +=
+    snprintf(outbuff + outindex, SENDBUFFSIZE - outindex - 1,
+	     "}\n");
+  
+  /* Terminate the string */
+  outbuff[outindex] = '\0';
+
+
+  /*fprintf(stdout, "%s", outbuff);*/
+
+  send_addrin.sin_family = AF_INET;
+  send_addrin.sin_port = htons(SENDPORT);
+  inet_aton(SENDDST, &(send_addrin.sin_addr));
+
+  sendto(send_fh, outbuff, outindex, 0,
+	 (const struct sockaddr *)&send_addrin, sizeof(send_addrin));
+   
   
 
 }
