@@ -1291,7 +1291,7 @@ void print_flow_json(const struct flow_summary *flow) {
 	       "\t\t{\n");
     outindex +=
       snprintf(outbuff + outindex, SENDBUFFSIZE - outindex - 1,
-	       "\t\t\"flow_source\": \"%s\"\n", inet_ntoa(temp_inaddr_flow));
+	       "\t\t\"flow_source\": \"%s\",\n", inet_ntoa(temp_inaddr_flow));
     outindex +=
       snprintf(outbuff + outindex, SENDBUFFSIZE - outindex - 1,
 	       "\t\t\"src_int\": %d,\n", flow_source->src_int);
