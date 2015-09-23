@@ -1,0 +1,1 @@
+flowtree is designed to receive netflow from multiple sources and de-duplicate the flows to reduce the processing by other netflow based tools.
